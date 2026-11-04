@@ -44,6 +44,7 @@
 #include "slang/driver/Driver.h"
 #include "slang/driver/SourceLoader.h"
 #include "slang/parsing/ParserMetadata.h"
+#include "slang/parsing/Preprocessor.h"
 #include "slang/syntax/AllSyntax.h"
 #include "slang/syntax/SyntaxTree.h"
 #include "slang/text/SourceLocation.h"
@@ -189,10 +190,19 @@ bool ServerDriver::parseAndLoadSources(const std::vector<std::string>& buildfile
     INFO("Creating ServerDriver with {} trees", driver.syntaxTrees.size());
     for (auto& tree : driver.syntaxTrees) {
         m_indexer.updateIncludes(*tree);
+        std::vector<std::filesystem::path> topLevel;
         for (auto buffer : tree->getSourceBufferIds()) {
             auto path = sm.getFullPath(buffer);
             if (!path.empty())
                 m_buildSourceUris.emplace(URI::fromFile(path));
+            if (!path.empty() && !sm.getIncludedFrom(buffer).valid())
+                topLevel.push_back(path);
+        }
+        if (topLevel.size() > 1) {
+            // A --single-unit tree. The preprocessor records its files in reverse order.
+            std::ranges::reverse(topLevel);
+            m_unitSources = std::move(topLevel);
+            m_unitLibrary = sm.getLibraryFor(tree->getSourceBufferIds()[0]);
         }
 
         auto uri = URI::fromFile(sm.getFullPath(tree->getSourceBufferIds()[0]));
@@ -609,9 +619,123 @@ bool ServerDriver::setIncludeContext(const IncludeContextSelection& selection) {
     return true;
 }
 
+struct ServerDriver::UnitMacroState {
+    /// Owns the macro syntax, cloned out of the preprocessor run that computed it.
+    BumpAllocator alloc;
+    /// Every buffer preprocessed to reach this state; the state is stale if any of them changed.
+    std::vector<BufferID> buffers;
+    /// Keeps the text of those buffers alive, since the macro tokens point into it.
+    std::vector<std::shared_ptr<void>> retainedBuffers;
+    /// Macros defined or redefined by the earlier files.
+    std::vector<const syntax::DefineDirectiveSyntax*> macros;
+    /// Default macros (built-ins and command line defines) undefined or redefined by those files.
+    std::vector<std::string> undefines;
+};
+
+bool ServerDriver::isUnitSource(const std::filesystem::path& path) const {
+    return std::ranges::find(m_unitSources, path) != m_unitSources.end();
+}
+
+std::shared_ptr<const ServerDriver::UnitMacroState> ServerDriver::getUnitMacroState(
+    const std::filesystem::path& path) {
+    auto self = std::ranges::find(m_unitSources, path);
+    if (self == m_unitSources.end() || self == m_unitSources.begin())
+        return nullptr;
+
+    auto& cached = m_unitMacroStates[path];
+    if (cached &&
+        std::ranges::all_of(cached->buffers, [&](BufferID id) { return sm.isLatestData(id); }))
+        return cached;
+
+    std::vector<SourceBuffer> earlier;
+    for (auto it = m_unitSources.begin(); it != self; ++it) {
+        auto buffer = sm.readSource(*it, m_unitLibrary);
+        if (!buffer) {
+            ERROR("Failed to read {} for the macros of {}: {}", it->string(), path.string(),
+                  buffer.error().message());
+            return nullptr;
+        }
+        earlier.push_back(*buffer);
+    }
+
+    // Preprocess every earlier file of the unit. The macro table at the end is exactly what this
+    // file starts with in the real compilation, including `undef and redefinitions, which the
+    // unit tree's final macro table can't tell us.
+    BumpAllocator scratch;
+    Diagnostics diagnostics;
+    parsing::Preprocessor preprocessor(sm, scratch, diagnostics, options);
+    for (auto it = earlier.rbegin(); it != earlier.rend(); ++it)
+        preprocessor.pushSource(*it);
+    while (preprocessor.next().kind != parsing::TokenKind::EndOfFile) {
+    }
+
+    auto state = std::make_shared<UnitMacroState>();
+    state->buffers = preprocessor.getMetadata().sourceBufferIds;
+    state->retainedBuffers = sm.retainBuffers(state->buffers);
+    const std::unordered_set<BufferID> preprocessed(state->buffers.begin(), state->buffers.end());
+
+    // A file parsed on its own already starts with the default macros, so only carry over what
+    // the earlier files changed, cloned so the preprocessor's token storage can be freed.
+    parsing::Preprocessor defaults(sm, scratch, diagnostics, options);
+    for (auto* macro : preprocessor.getDefinedMacros()) {
+        auto location = sm.getFullyOriginalLoc(macro->name.location());
+        if (!preprocessed.contains(location.buffer()))
+            continue;
+        auto name = macro->name.valueText();
+        if (defaults.isDefined(name))
+            state->undefines.emplace_back(name);
+        state->macros.push_back(syntax::deepClone(*macro, state->alloc));
+    }
+    for (auto* macro : defaults.getDefinedMacros()) {
+        auto name = macro->name.valueText();
+        if (!preprocessor.isDefined(name))
+            state->undefines.emplace_back(name);
+    }
+
+    cached = std::move(state);
+    return cached;
+}
+
+std::shared_ptr<syntax::SyntaxTree> ServerDriver::parseUnitTree() {
+    std::vector<SourceBuffer> buffers;
+    buffers.reserve(m_unitSources.size());
+    for (const auto& path : m_unitSources) {
+        auto buffer = sm.readSource(path, m_unitLibrary);
+        if (!buffer) {
+            ERROR("Failed to read {} for its single-unit tree: {}", path.string(),
+                  buffer.error().message());
+            return nullptr;
+        }
+        buffers.push_back(*buffer);
+    }
+    auto tree = syntax::SyntaxTree::fromBuffers(buffers, sm, options);
+    m_indexer.updateIncludes(*tree);
+    return tree;
+}
+
 std::shared_ptr<syntax::SyntaxTree> ServerDriver::parseShallowTree(SourceBuffer buffer,
                                                                    Bag& documentOptions) {
     documentOptions = options;
+
+    // A later file of a --single-unit build starts with the macros of the files before it.
+    auto unitState = getUnitMacroState(sm.getFullPath(buffer.id));
+    if (unitState) {
+        auto ppOptions = documentOptions.getOrDefault<parsing::PreprocessorOptions>();
+        ppOptions.undefines.insert(ppOptions.undefines.end(), unitState->undefines.begin(),
+                                   unitState->undefines.end());
+        documentOptions.set(std::move(ppOptions));
+        auto tree = syntax::SyntaxTree::fromBuffer(buffer, sm, documentOptions, unitState->macros);
+        m_indexer.updateIncludes(*tree);
+
+        // The inherited macro syntax lives in the unit state: keep it alive with the tree.
+        struct Owner {
+            std::shared_ptr<const UnitMacroState> state;
+            std::shared_ptr<syntax::SyntaxTree> tree;
+        };
+        auto owner = std::make_shared<Owner>(Owner{std::move(unitState), std::move(tree)});
+        return std::shared_ptr<syntax::SyntaxTree>(owner, owner->tree.get());
+    }
+
     auto tree = syntax::SyntaxTree::fromBuffer(buffer, sm, documentOptions);
     if (!m_buildSourceUris.contains(URI::fromFile(sm.getFullPath(buffer.id)))) {
         const auto configured = options.getOrDefault<parsing::PreprocessorOptions>();

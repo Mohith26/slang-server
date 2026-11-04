@@ -57,6 +57,10 @@ private:
     /// The syntax tree for this document
     std::shared_ptr<slang::syntax::SyntaxTree> m_tree;
 
+    /// For the document that owns a --single-unit build tree: that whole-unit tree, which the
+    /// full compilation uses. Kept apart from m_tree so that edits reparse only this file.
+    std::shared_ptr<slang::syntax::SyntaxTree> m_unitTree;
+
     /// Document analysis for syntax and symbol analysis.
     /// Shared so that callers can hold the analysis alive even if getAnalysis() recreates it.
     std::shared_ptr<ShallowAnalysis> m_analysis;
@@ -84,6 +88,10 @@ public:
     // Open a Document from a syntax tree (parsed from slang Driver)
     static std::shared_ptr<SlangDoc> fromTree(ServerDriver& driver,
                                               std::shared_ptr<slang::syntax::SyntaxTree> tree);
+
+    /// The tree to add to the full compilation. This is the whole unit for the document that
+    /// owns a --single-unit build tree, and the document's own tree otherwise.
+    std::shared_ptr<slang::syntax::SyntaxTree> getCompilationTree();
 
     // Open a Document from text (LSP open)
     static std::shared_ptr<SlangDoc> fromText(ServerDriver& driver, const URI& uri,

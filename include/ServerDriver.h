@@ -111,6 +111,12 @@ public:
     /// Infer include paths for this syntax tree only, then refresh its include relationships.
     std::shared_ptr<syntax::SyntaxTree> parseShallowTree(SourceBuffer buffer, Bag& documentOptions);
 
+    /// Reparse a --single-unit build's tree from the latest text of all of its files.
+    std::shared_ptr<syntax::SyntaxTree> parseUnitTree();
+
+    /// Whether this file is part of a multi-file --single-unit build tree.
+    bool isUnitSource(const std::filesystem::path& path) const;
+
     /// Identifies a file's selected enclosing source and occurrence within that source.
     struct IncludeContextSelection {
         /// File whose analysis should use this context.
@@ -242,6 +248,23 @@ private:
 
     /// Every source file covered by the build, including secondary single-unit buffers.
     flat_hash_set<URI> m_buildSourceUris;
+
+    /// Top-level files of a --single-unit build in compilation order; empty otherwise.
+    std::vector<std::filesystem::path> m_unitSources;
+
+    /// Source library shared by every file in the --single-unit build.
+    const SourceLibrary* m_unitLibrary = nullptr;
+
+    /// Macros that a --single-unit file starts with: the state after every file before it.
+    struct UnitMacroState;
+
+    /// Macro state per --single-unit file, recomputed only when an earlier file changes.
+    std::unordered_map<std::filesystem::path, std::shared_ptr<const UnitMacroState>>
+        m_unitMacroStates;
+
+    /// Get the macros a --single-unit file sees at its start, or null if it isn't a later file
+    /// of a unit.
+    std::shared_ptr<const UnitMacroState> getUnitMacroState(const std::filesystem::path& path);
 
     /// Explicit include selections by canonical header path, preserved across driver reloads.
     std::unordered_map<std::filesystem::path, IncludeContextSelection> m_includeSelections;

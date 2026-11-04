@@ -482,7 +482,7 @@ ServerCompilation::ServerCompilation(std::vector<std::shared_ptr<SlangDoc>> docu
 void ServerCompilation::indexModuleDocs() {
     m_moduleToDoc.clear();
     for (const auto& [path, doc] : m_documents) {
-        auto tree = doc->getSyntaxTree();
+        auto tree = doc->getCompilationTree();
         if (!tree) {
             continue;
         }

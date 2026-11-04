@@ -440,6 +440,105 @@ TEST_CASE("RecreatingSingleUnitBuildDoesNotShallowAnalyzeOpenBuildFile") {
     CHECK_FALSE(server.getDoc(childUri)->hasAnalysis());
 }
 
+// single_unit_macros compiles defs.v, child.sv, top.sv and cleanup.v as one unit. defs.v defines
+// WIDTH and MODE, and cleanup.v (the last file) undefines WIDTH and redefines MODE, so the macro
+// state at the end of the unit is not the state any of the middle files see.
+namespace {
+std::vector<std::string> diagMessages(const std::vector<lsp::Diagnostic>& diagnostics) {
+    std::vector<std::string> messages;
+    for (const auto& diagnostic : diagnostics)
+        messages.push_back(diagnostic.message);
+    return messages;
+}
+
+std::vector<std::string> diagMessages(ServerHarness& server, std::string_view fileName) {
+    return diagMessages(server.client.getDiagnostics(URI::fromFile(fs::current_path() / fileName)));
+}
+} // namespace
+
+TEST_CASE("SingleUnitEditSeesMacrosFromEarlierFiles") {
+    ServerHarness server("single_unit_macros");
+    for (std::string_view fileName : {"child.sv", "top.sv"}) {
+        CAPTURE(fileName);
+        auto doc = server.openFile(std::string(fileName));
+        doc.append("\n// edited\n");
+        doc.publishChanges();
+        CHECK(diagMessages(doc.getDiagnostics()) == std::vector<std::string>{});
+    }
+}
+
+TEST_CASE("SingleUnitEditUsesMacroStateAtFileBoundary") {
+    ServerHarness server("single_unit_macros");
+
+    // cleanup.v is the document that owns the unit tree. Text inserted at its start must see WIDTH
+    // even though cleanup.v itself undefines it further down.
+    auto cleanup = server.openFile("cleanup.v");
+    cleanup.insert(0, "module late (input logic [`WIDTH-1:0] a, output logic [`WIDTH-1:0] y);\n"
+                      "    assign y = a;\nendmodule\n");
+    cleanup.publishChanges();
+    CHECK(diagMessages(cleanup.getDiagnostics()) == std::vector<std::string>{});
+
+    // MODE is redefined to 2 after child.sv, so child.sv must still see 1.
+    auto child = server.openFile("child.sv");
+    child.append("\n");
+    child.publishChanges();
+    CHECK(diagMessages(child.getDiagnostics()) == std::vector<std::string>{});
+}
+
+TEST_CASE("SingleUnitEditSeesUnsavedChangesInEarlierFiles") {
+    ServerHarness server("single_unit_macros");
+    auto child = server.openFile("child.sv");
+    child.append("\n");
+    child.publishChanges();
+    REQUIRE(diagMessages(child.getDiagnostics()).empty());
+
+    auto defs = server.openFile("defs.v");
+    defs.replaceAll("`define WIDTH 4\n`define MODE 3\n");
+    defs.publishChanges();
+
+    child.append("\n");
+    child.publishChanges();
+    auto messages = diagMessages(child.getDiagnostics());
+    CHECK(std::ranges::any_of(messages, [](const auto& message) {
+        return message.find("child sees the MODE defined before it") != std::string::npos;
+    }));
+    CHECK(std::ranges::none_of(messages, [](const auto& message) {
+        return message.find("unknown macro") != std::string::npos;
+    }));
+}
+
+TEST_CASE("SingleUnitSaveRecompilesWholeUnit") {
+    ServerHarness server("single_unit_macros");
+    auto realError = "child sees the MODE defined before it";
+
+    for (std::string_view fileName : {"child.sv", "top.sv", "cleanup.v"}) {
+        CAPTURE(fileName);
+        auto doc = server.openFile(std::string(fileName));
+        doc.append("\n");
+        doc.save();
+
+        // Every file is still compiled, with the macros it sees in the unit.
+        for (std::string_view other : {"defs.v", "child.sv", "top.sv"})
+            CHECK(diagMessages(server, other) == std::vector<std::string>{});
+        auto comp = server.m_driver->comp.get();
+        REQUIRE(comp);
+        CHECK(comp->getInstancesOfModule("child").size() == 1);
+    }
+
+    // A real error in a secondary file survives the save, and nothing false is added.
+    auto child = server.openFile("child.sv");
+    auto text = child.getText();
+    auto pos = text.find("`MODE == 1");
+    REQUIRE(pos != std::string::npos);
+    child.erase(pos + 9, pos + 10);
+    child.insert(pos + 9, "3");
+    child.save();
+    auto messages = diagMessages(child.getDiagnostics());
+    REQUIRE(messages.size() == 1);
+    CHECK(messages[0].find(realError) != std::string::npos);
+    CHECK(diagMessages(server, "top.sv") == std::vector<std::string>{});
+}
+
 TEST_CASE("OpenNonBuildFileGetsShallowDiags") {
     ServerHarness server("comp_repo");
     server.setBuildFile("cpu_design.f");

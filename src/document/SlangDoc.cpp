@@ -55,7 +55,22 @@ std::shared_ptr<SlangDoc> SlangDoc::fromTree(ServerDriver& driver,
     auto uri = URI::fromFile(driver.sm.getFullPath(tree->getSourceBufferIds()[0]));
     auto ret = std::make_shared<SlangDoc>(driver, uri, buffer);
     ret->m_tree = tree;
+    if (driver.isUnitSource(driver.sm.getFullPath(buffer.id)))
+        ret->m_unitTree = tree;
     return ret;
+}
+
+std::shared_ptr<syntax::SyntaxTree> SlangDoc::getCompilationTree() {
+    if (!m_unitTree)
+        return getSyntaxTree();
+    if (!hasValidBuffers(m_sourceManager, m_unitTree)) {
+        // A file in the unit changed: rebuild the whole unit, not just this document's file.
+        auto tree = m_driver.parseUnitTree();
+        if (!tree)
+            return getSyntaxTree();
+        m_unitTree = std::move(tree);
+    }
+    return m_unitTree;
 }
 
 std::shared_ptr<SlangDoc> SlangDoc::fromText(ServerDriver& driver, const URI& uri,
@@ -314,7 +329,10 @@ bool SlangDoc::reloadBuffer() {
 }
 
 void SlangDoc::issueParseDiagnostics(DiagnosticEngine& diagEngine) {
-    for (auto& diag : getSyntaxTree()->diagnostics()) {
+    // The unit's tree reports parse diagnostics for every file in a --single-unit build.
+    if (!m_unitTree && m_driver.isUnitSource(m_sourceManager.getFullPath(m_buffer.id)))
+        return;
+    for (auto& diag : getCompilationTree()->diagnostics()) {
         if (m_includeCompilation &&
             m_sourceManager.getFullyOriginalLoc(diag.location).buffer() != m_buffer.id)
             continue;

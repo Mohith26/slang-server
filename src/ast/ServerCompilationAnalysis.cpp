@@ -28,7 +28,7 @@ ServerCompilationAnalysis::ServerCompilationAnalysis(
     std::unordered_set<BufferID> seenBuffers;
 
     for (auto& [_, doc] : documents) {
-        auto tree = doc->getSyntaxTree();
+        auto tree = doc->getCompilationTree();
         compilation.addSyntaxTree(tree);
 
         for (auto bufferId : tree->getSourceBufferIds()) {
